@@ -4,15 +4,14 @@ import cors from 'cors';
 import multer from 'multer';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import mammoth from 'mammoth';
 import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
 import OpenAI from 'openai';
-import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
+import { spawn, execFileSync } from 'child_process';
 
-// Optional: silence worker requirement for Node usage
-try { pdfjsLib.GlobalWorkerOptions.workerSrc = undefined; } catch {}
-
+// ---------- Paths / constants ----------
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -20,174 +19,217 @@ const PORT = process.env.PORT || 8787;
 const DATA_DIR = path.join(__dirname, 'data');
 const STORE_PATH = path.join(DATA_DIR, 'store.json');
 
-// ---- RAG tuning knobs ----
-const MAX_CHARS_PER_CHUNK = 3500;   // target size per chunk
-const CHUNK_OVERLAP = 300;          // overlap between chunks
-const MAX_CHUNKS_PER_DOC = 500;     // hard cap to avoid OOM / huge requests
-const EMBEDDING_BATCH_SIZE = 64;    // batch size for embeddings.create
+// RAG knobs
+const MAX_CHARS_PER_CHUNK  = 3000;     // slightly smaller chunks -> lower peak memory
+const CHUNK_OVERLAP        = 200;
+const MAX_CHUNKS_PER_DOC   = 300;      // streamed cap per uploaded doc
+const MAX_CHUNKS_FOR_ASK   = 800;      // total per /api/ask across docs
+const EMBEDDING_BATCH_SIZE = 64;
 
+// Extraction caps (strict)
+const MAX_TEXT_PER_FILE    = 80_000;   // we won't read more than this many chars from any file
+const MAX_STORE_BYTES      = 5 * 1024 * 1024; // refuse >5MB store.json (auto-reset)
+const PDF_TIMEOUT_MS       = 8000;     // kill pdftotext after 8s (safety)
+const STREAM_HWM           = 16 * 1024; // 16KB stream buffer
+
+// ---------- App ----------
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// ---- Multer (memory) with limits ----
+// Multer: disk storage (no Buffers held in memory)
+const UPLOAD_DIR = path.join(os.tmpdir(), 'scholarai-uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const safe = (file.originalname || 'upload').replace(/[^\w.\-]+/g, '_');
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2)}-${safe}`);
+  }
+});
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024, files: 10 }, // 20MB each, max 10 files
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024, files: 10 }, // 20MB/file
 });
 
-// ---- OpenAI client ----
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ------------------ Robust store helpers ------------------
-function ensureDataDir() {
-  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-}
+// Detect Poppler
+let PDFTOTEXT_AVAILABLE = false;
+try { execFileSync('pdftotext', ['-v'], { stdio: 'ignore' }); PDFTOTEXT_AVAILABLE = true; } catch {}
+console.log('pdftotext available:', PDFTOTEXT_AVAILABLE);
 
+// ---------- Store (self-heal, text-only) ----------
+function ensureDataDir() { try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {} }
+function writeStore(obj) {
+  const tmp = STORE_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+  fs.renameSync(tmp, STORE_PATH);
+}
 function loadStore() {
   ensureDataDir();
   try {
+    if (!fs.existsSync(STORE_PATH)) { const s = { docs: [] }; writeStore(s); return s; }
+    const st = fs.statSync(STORE_PATH);
+    if (st.size === 0 || st.size > MAX_STORE_BYTES) { const s = { docs: [] }; writeStore(s); return s; }
     const raw = fs.readFileSync(STORE_PATH, 'utf-8').trim();
-    if (!raw) throw new Error('empty store');
+    if (!raw) { const s = { docs: [] }; writeStore(s); return s; }
     const parsed = JSON.parse(raw);
     if (!parsed.docs) parsed.docs = [];
+    // strip legacy embeddings
+    for (const d of parsed.docs) if (Array.isArray(d?.chunks)) for (const c of d.chunks) if (c && 'embedding' in c) delete c.embedding;
     return parsed;
   } catch {
-    const safe = { docs: [] };
-    try { fs.writeFileSync(STORE_PATH, JSON.stringify(safe, null, 2)); } catch {}
-    return safe;
+    const s = { docs: [] }; writeStore(s); return s;
   }
 }
+function saveStore(store) { ensureDataDir(); writeStore(store); }
 
-function saveStore(store) {
-  ensureDataDir();
-  const tmp = STORE_PATH + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
-  fs.renameSync(tmp, STORE_PATH);
-}
-
-ensureDataDir();
-if (!fs.existsSync(STORE_PATH)) saveStore({ docs: [] });
-
-// ------------------ Utilities ------------------
-function chunkText(text, chunkSize = MAX_CHARS_PER_CHUNK, overlap = CHUNK_OVERLAP) {
-  const cleaned = (text || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\s+\n/g, '\n')
-    .replace(/\n{3,}/g, '\n\n');
-
-  if (!cleaned.length) return [];
-
-  const chunks = [];
-  let i = 0;
-
-  // Guard: overlap must be smaller than chunkSize
-  const safeOverlap = Math.max(0, Math.min(overlap, Math.floor(chunkSize / 2)));
-
-  while (i < cleaned.length) {
-    const end = Math.min(i + chunkSize, cleaned.length);
-    const slice = cleaned.slice(i, end).trim();
+// ---------- Chunking (stream-friendly) ----------
+function pushChunksFromBuffer(chunks, buffer) {
+  while (buffer.value.length >= MAX_CHARS_PER_CHUNK && chunks.length < MAX_CHUNKS_PER_DOC) {
+    const slice = buffer.value.slice(0, MAX_CHARS_PER_CHUNK).trim();
     if (slice) chunks.push(slice);
-    // move forward with overlap
-    i = end - safeOverlap;
-    if (i <= 0) i = end; // avoid stuck loops on small texts
+    buffer.value = buffer.value.slice(MAX_CHARS_PER_CHUNK - CHUNK_OVERLAP);
   }
+}
+
+async function streamReadableToChunks(rs) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const buf = { value: '' };
+    let total = 0;
+    let ended = false;
+
+    rs.setEncoding('utf8');
+    rs.on('data', (chunk) => {
+      if (ended) return;
+      // enforce total char cap
+      const remain = MAX_TEXT_PER_FILE - total;
+      if (remain <= 0 || chunks.length >= MAX_CHUNKS_PER_DOC) {
+        ended = true;
+        try { rs.destroy(); } catch {}
+        return;
+      }
+      // normalize small piece only
+      let piece = chunk.replace(/\r\n/g, '\n');
+      if (piece.length > remain) piece = piece.slice(0, remain);
+      total += piece.length;
+
+      buf.value += piece;
+      pushChunksFromBuffer(chunks, buf);
+
+      if (chunks.length >= MAX_CHUNKS_PER_DOC || total >= MAX_TEXT_PER_FILE) {
+        ended = true;
+        try { rs.destroy(); } catch {}
+      }
+    });
+    rs.on('error', (e) => reject(e));
+    rs.on('close', () => {
+      if (!ended) {
+        // flush remainder as a final chunk
+        const tail = buf.value.trim();
+        if (tail && chunks.length < MAX_CHUNKS_PER_DOC) chunks.push(tail);
+      }
+      resolve(chunks);
+    });
+    rs.on('end', () => {
+      // handled by 'close', but keep for safety
+    });
+  });
+}
+
+// ---------- Extractors (streaming; no big strings) ----------
+function extractChunksFromTxtPath(p) {
+  const rs = fs.createReadStream(p, { encoding: 'utf8', highWaterMark: STREAM_HWM });
+  return streamReadableToChunks(rs);
+}
+async function extractChunksFromDocxPath(p) {
+  // DOCX -> mammoth returns a single string; cap aggressively, then chunk
+  const res = await mammoth.extractRawText({ path: p });
+  const text = (res.value || '').slice(0, MAX_TEXT_PER_FILE);
+  const chunks = [];
+  const buf = { value: '' };
+  let i = 0;
+  while (i < text.length && chunks.length < MAX_CHUNKS_PER_DOC) {
+    const take = Math.min(MAX_CHARS_PER_CHUNK, text.length - i);
+    buf.value += text.slice(i, i + take);
+    i += take;
+    pushChunksFromBuffer(chunks, buf);
+  }
+  const tail = buf.value.trim();
+  if (tail && chunks.length < MAX_CHUNKS_PER_DOC) chunks.push(tail);
   return chunks;
 }
-
-function smartChunk(wholeText, targetMaxChunks = MAX_CHUNKS_PER_DOC) {
-  // Start with defaults
-  let size = MAX_CHARS_PER_CHUNK;
-  let chunks = chunkText(wholeText, size, CHUNK_OVERLAP);
-
-  // If too many chunks, grow chunk size progressively until under the cap
-  while (chunks.length > targetMaxChunks && size < 20000) {
-    size = Math.floor(size * 1.5);
-    chunks = chunkText(wholeText, size, CHUNK_OVERLAP);
+function extractChunksFromPdfPath(p) {
+  if (!PDFTOTEXT_AVAILABLE) {
+    const err = new Error('PDFTOTEXT_MISSING');
+    err.code = 'PDFTOTEXT_MISSING';
+    throw err;
   }
+  return new Promise((resolve, reject) => {
+    const child = spawn('pdftotext', ['-layout', '-nopgbrk', '-enc', 'UTF-8', p, '-'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const rs = child.stdout;
+    let timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, PDF_TIMEOUT_MS);
 
-  // Still too many? Truncate to the cap (last resort)
-  if (chunks.length > targetMaxChunks) {
-    chunks = chunks.slice(0, targetMaxChunks);
-  }
+    streamReadableToChunks(rs)
+      .then((chunks) => {
+        clearTimeout(timer);
+        try { child.kill('SIGTERM'); } catch {}
+        resolve(chunks);
+      })
+      .catch((e) => {
+        clearTimeout(timer);
+        try { child.kill('SIGKILL'); } catch {}
+        reject(e);
+      });
 
-  return chunks;
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
 }
 
-
-function cosine(a, b) {
-  let dot = 0, na = 0, nb = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    na += a[i] * a[i];
-    nb += b[i] * b[i];
+async function extractFileToChunks(filePath, mimeGuess, origLower) {
+  if (origLower.endsWith('.pdf') || mimeGuess === 'application/pdf' || mimeGuess === 'application/x-pdf') {
+    return extractChunksFromPdfPath(filePath);
   }
-  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-8);
+  if (origLower.endsWith('.docx') || mimeGuess === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+    return extractChunksFromDocxPath(filePath);
+  }
+  // TXT / MD
+  if (origLower.endsWith('.txt') || origLower.endsWith('.md') || (mimeGuess || '').startsWith('text/')) {
+    return extractChunksFromTxtPath(filePath);
+  }
+  throw new Error(`Unsupported file type: ${mimeGuess || 'unknown'} (${origLower})`);
 }
 
-function toUint8Array(buf) {
-  // Accept Buffer or Uint8Array; return a plain Uint8Array (not a Buffer)
-  if (buf instanceof Uint8Array && !Buffer.isBuffer(buf)) return buf;
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-}
-
-async function extractText(file) {
-  const mime = file.mimetype || '';
-  const name = (file.originalname || '').toLowerCase();
-
-  // ---- PDF (handle common MIME and octet-stream fallback) ----
-  if (
-    mime === 'application/pdf' ||
-    mime === 'application/x-pdf' ||
-    (mime === 'application/octet-stream' && name.endsWith('.pdf'))
-  ) {
-    const data = toUint8Array(file.buffer);
-    const pdf = await pdfjsLib.getDocument({ data }).promise;
-    let out = '';
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const content = await page.getTextContent();
-      const text = content.items.map(it => it.str ?? '').join(' ');
-      out += text + '\n';
-    }
-    return out;
-  }
-
-  // ---- DOCX ----
-  if (
-    mime === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-    (mime === 'application/octet-stream' && name.endsWith('.docx'))
-  ) {
-    const result = await mammoth.extractRawText({ buffer: file.buffer });
-    return result.value || '';
-  }
-
-  // ---- TXT / MD ----
-  if (mime.startsWith('text/') || name.endsWith('.txt') || name.endsWith('.md')) {
-    return file.buffer.toString('utf-8');
-  }
-
-  throw new Error(`Unsupported file type: ${mime || 'unknown'} (${name})`);
-}
-
+// ---------- Embeddings (on-demand, batched) ----------
 async function embedTexts(texts, batchSize = EMBEDDING_BATCH_SIZE) {
-  if (!Array.isArray(texts) || texts.length === 0) return [];
-
+  if (!Array.isArray(texts) || !texts.length) return [];
   const out = [];
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize);
-    const res = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: batch
-    });
-    // OpenAI returns one embedding per input, in order
+    const res = await openai.embeddings.create({ model: 'text-embedding-3-small', input: batch });
     for (const d of res.data) out.push(d.embedding);
   }
   return out;
 }
+function cosine(a, b) {
+  let dot = 0, na = 0, nb = 0;
+  for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+  return dot / (Math.sqrt(na) * Math.sqrt(nb) + 1e-8);
+}
+function limitScopeChunks(scopeDocs, cap = MAX_CHUNKS_FOR_ASK) {
+  const total = scopeDocs.reduce((s, d) => s + d.chunks.length, 0);
+  if (total <= cap) return scopeDocs.map(d => ({ doc: d, chunks: d.chunks }));
+  const perDoc = Math.max(1, Math.floor(cap / scopeDocs.length));
+  return scopeDocs.map(d => ({ doc: d, chunks: d.chunks.slice(0, perDoc) }));
+}
 
-
-// ------------------ Routes ------------------
+// ---------- Routes ----------
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
 app.get('/api/docs', (_req, res) => {
@@ -196,22 +238,19 @@ app.get('/api/docs', (_req, res) => {
   res.json({ docs });
 });
 
-// ---- Upload with Multer error handling ----
+// Upload: stream-extract -> store ONLY TEXT
 const uploadHandler = upload.array('files', 10);
 
 app.post('/api/upload', (req, res) => {
   uploadHandler(req, res, async (err) => {
     if (err) {
-      // Multer errors (e.g., LIMIT_FILE_SIZE) won’t crash the process
       const code = err.code || 'UPLOAD_ERROR';
       const status = code === 'LIMIT_FILE_SIZE' ? 413 : 400;
       return res.status(status).json({ error: code });
     }
 
     try {
-      if (!process.env.OPENAI_API_KEY) {
-        return res.status(400).json({ error: 'Missing OPENAI_API_KEY on server' });
-      }
+      if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'Missing OPENAI_API_KEY on server' });
       const files = req.files || [];
       if (!files.length) return res.status(400).json({ error: 'No files uploaded' });
 
@@ -219,35 +258,33 @@ app.post('/api/upload', (req, res) => {
       const out = [];
 
       for (const file of files) {
-        let text = '';
+        const nameLower = (file.originalname || '').toLowerCase();
+        let chunks = [];
         try {
-          text = (await extractText(file)).trim();
+          chunks = await extractFileToChunks(file.path, file.mimetype || '', nameLower);
         } catch (e) {
-          // Skip problematic files but keep the server alive
-          console.error('extractText failed:', e?.message || e);
+          if (e?.code === 'PDFTOTEXT_MISSING') {
+            return res.status(501).json({
+              error: 'PDFTOTEXT_MISSING',
+              fix: 'Install Poppler (pdftotext) and restart. On macOS: brew install poppler'
+            });
+          }
+          console.error('extractFileToChunks failed:', e?.message || e);
+          // continue to next file
           continue;
+        } finally {
+          // always remove uploaded temp file
+          try { fs.unlinkSync(file.path); } catch {}
         }
-        if (!text) continue;
 
-        const chunks = smartChunk(text);
         if (!chunks.length) continue;
-
-        // batch embeddings to avoid giant single requests
-        const embeddings = await embedTexts(chunks, EMBEDDING_BATCH_SIZE);
-
-        // Guard against any mismatch (shouldn’t happen, but be safe)
-        if (embeddings.length !== chunks.length) {
-        console.error('Embedding mismatch: got', embeddings.length, 'for', chunks.length, 'chunks');
-        continue;
-}
-
 
         const doc = {
           id: uuidv4(),
           name: file.originalname,
           createdAt: new Date().toISOString(),
           chunkCount: chunks.length,
-          chunks: chunks.map((t, i) => ({ id: i, text: t, embedding: embeddings[i] }))
+          chunks: chunks.map((t, i) => ({ id: i, text: t })) // store only text
         };
 
         store.docs.push(doc);
@@ -263,36 +300,31 @@ app.post('/api/upload', (req, res) => {
   });
 });
 
-// ---- Ask (RAG) ----
+// Ask: embed question + (limited) chunks on the fly; then rank
 app.post('/api/ask', async (req, res) => {
   try {
     const { question, docIds, k = 6 } = req.body || {};
     if (!question || typeof question !== 'string') return res.status(400).json({ error: 'Missing question' });
 
     const store = loadStore();
-    const scope = Array.isArray(docIds) && docIds.length
+    const scopeDocs = (Array.isArray(docIds) && docIds.length)
       ? store.docs.filter(d => docIds.includes(d.id))
       : store.docs;
 
-    if (!scope.length) return res.status(400).json({ error: 'No docs available. Upload first.' });
+    if (!scopeDocs.length) return res.status(400).json({ error: 'No docs available. Upload first.' });
+
+    const packs = limitScopeChunks(scopeDocs, MAX_CHUNKS_FOR_ASK);
+    const all = [];
+    for (const { doc, chunks } of packs) for (const ch of chunks) all.push({ docId: doc.id, name: doc.name, chunkId: ch.id, text: ch.text });
 
     const qEmbed = (await openai.embeddings.create({
       model: 'text-embedding-3-small',
       input: question
     })).data[0].embedding;
 
-    const scored = [];
-    for (const doc of scope) {
-      for (const ch of doc.chunks) {
-        scored.push({
-          docId: doc.id,
-          name: doc.name,
-          chunkId: ch.id,
-          text: ch.text,
-          score: cosine(qEmbed, ch.embedding)
-        });
-      }
-    }
+    const chunkEmbeds = await embedTexts(all.map(x => x.text), EMBEDDING_BATCH_SIZE);
+
+    const scored = all.map((item, i) => ({ ...item, score: cosine(qEmbed, chunkEmbeds[i]) }));
     scored.sort((a, b) => b.score - a.score);
     const top = scored.slice(0, k);
 
@@ -323,45 +355,12 @@ Cite like [${top.map((_, i) => i + 1).join(', ')}] where relevant. Be concise an
   }
 });
 
-// ---- Summarize ----
-app.post('/api/summarize', async (req, res) => {
-  try {
-    const { docId } = req.body || {};
-    const store = loadStore();
-    const doc = store.docs.find(d => d.id === docId);
-    if (!doc) return res.status(404).json({ error: 'Doc not found' });
-
-    const text = doc.chunks.map(c => c.text).join('\n\n').slice(0, 100_000);
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.3,
-      messages: [
-        { role: 'system', content: 'Summarize clearly with bullet points and key terms.' },
-        { role: 'user', content: text }
-      ]
-    });
-
-    res.json({ summary: completion.choices[0]?.message?.content || '' });
-  } catch (err) {
-    console.error('summarize route error:', err);
-    res.status(500).json({ error: String(err?.message || err) });
-  }
-});
-
-// ------------------ Global error + process guards ------------------
+// Global guards
 app.use((err, _req, res, _next) => {
   console.error('global error handler:', err);
   res.status(500).json({ error: String(err?.message || err) });
 });
+process.on('uncaughtException', (err) => console.error('uncaughtException:', err));
+process.on('unhandledRejection', (reason) => console.error('unhandledRejection:', reason));
 
-process.on('uncaughtException', (err) => {
-  console.error('uncaughtException:', err);
-  // keep process alive; at worst, healthcheck fails but server continues
-});
-process.on('unhandledRejection', (reason) => {
-  console.error('unhandledRejection:', reason);
-});
-
-app.listen(PORT, () => {
-  console.log(`ScholarAI server listening on http://localhost:${PORT}`);
-});
+app.listen(PORT, () => console.log(`ScholarAI server listening on http://localhost:${PORT}`));
