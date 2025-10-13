@@ -1,16 +1,4 @@
 {
   "docs": [
-    {
-      "id": "0012e612-1b12-48fa-b6e6-2ee544b13e97",
-      "name": "AssignmentExample.pdf",
-      "createdAt": "2025-10-13T19:33:28.852Z",
-      "chunkCount": 1,
-      "chunks": [
-        {
-          "id": 0,
-          "text": "Oakland University                                            Fall, 2025\n  School of Engineering and Computer Science                    Dr. Hadeel Mohammed Jawad\n  Computer Science and Engineering Department                   Assignment #4 (100 Points)\n  CSI 4230: Mobile & Smart Phone App Dev                        Due Date: October 9, 2025\nNote: Your project name should be \"Assignmnet4-YourName\". Submit screenshots, compressed project file (without the\n\"Build\" folder), and a 5 min video link showing your running app with a brief explanation about your code. You don't\nhave to show your face. You can use Loom for recording.\n\n\nWrite a program that generates the hex code of the background/text color from RGB SeekBars. For example,\nthe program will display #FF0000 if a user sets the red SeekBar to the max value and the rest to zero. By\ndefault, the \"Background Color\" radio button is checked so the background color should change with the\nSeekBars values. If the user chooses the \"Text Color\" Radio button then the text color should change with the\nSeekBars' values; the corresponding hex code should also change. If the user unchecks the \"Background Color\"\nor the \"Text Color\" checkbox, the color code should disappear as shown in the screenshots. Use an oval shape\nfor both TextViews, Change the Style of the Radio buttons, Checkboxes, and SeekBar using Style XML file, use\nTableLayout, and use Listeners to change the color and the color code.\n\nHint:\n   • the following statement gives you the hex code of the color:\nString hex = String.format (\"#%02X%02X%02X\", red, green, blue);\n\n  • the following code change the solid color of the shape where tv is a TextView:\nGradientDrawable myGrad = (GradientDrawable)tv.getBackground();\nmyGrad.setColor(Color.rgb(red, green, blue));"
-        }
-      ]
-    }
   ]
 }

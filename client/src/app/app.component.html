@@ -1,65 +1,150 @@
-<div class="container">
-  <header>
-    <h1>{{ title }}</h1>
-    <span class="spacer"></span>
-    <button class="link" (click)="clear()">Clear chat</button>
-  </header>
+<div class="shell">
+  <!-- animated gradient background -->
+  <div class="bg fx-blob-1"></div>
+  <div class="bg fx-blob-2"></div>
+  <div class="bg fx-blob-3"></div>
 
-  <section class="upload">
-    <div class="drop" (drop)="onDrop($event)" (dragover)="onDragOver($event)">
-      <p><strong>Drop PDF/DOCX/TXT here</strong> or</p>
-      <label class="btn">
-        Select files
-        <input type="file" multiple (change)="onPick($event)" accept=".pdf,.docx,.txt" />
-      </label>
-      <span *ngIf="uploading()">Uploading & processing…</span>
-    </div>
-  </section>
-
-  <section class="docs" *ngIf="docs().length">
-    <h2>Uploaded Notes</h2>
-    <ul>
-      <li *ngFor="let d of docs()">
-        <label>
-          <input type="checkbox" [checked]="selected().has(d.id)" (change)="toggleDoc(d.id)" />
-          <strong>{{ d.name }}</strong>
-          <small>({{ d.chunkCount }} chunks)</small>
-        </label>
-        <button class="link" (click)="doSummarize(d)">Summarize</button>
-      </li>
-    </ul>
-  </section>
-
-  <section class="ask">
-    <h2>Ask your notes</h2>
-    <div class="controls">
-      <input [(ngModel)]="question" placeholder="e.g., What are the 3 key steps of cellular respiration?" />
-      <label>K:
-        <input type="number" [(ngModel)]="k" min="3" max="12">
-      </label>
-      <button class="primary" (click)="ask()">Ask</button>
-    </div>
-    <p class="hint">Tip: select specific docs above to narrow context. K = how many chunks to retrieve.</p>
-  </section>
-
-  <section class="chat" *ngIf="chat().length">
-    <h2>Chat</h2>
-    <div class="bubble" *ngFor="let m of chat()"
-         [class.me]="m.role==='user'"
-         [class.ai]="m.role==='assistant'">
-      <pre>{{ m.content }}</pre>
-      <div class="cites" *ngIf="m.citations?.length">
-        <span *ngFor="let c of m.citations">[{{c.label}} {{c.name}}#{{c.chunkId}}]</span>
+  <div class="container fade-in">
+    <header class="topbar card slide-up">
+      <div class="brand">
+        <div class="logo">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <defs>
+              <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#8E2DE2"/>
+                <stop offset="100%" stop-color="#4A00E0"/>
+              </linearGradient>
+            </defs>
+            <path fill="url(#g1)"
+              d="M12 2a10 10 0 1 0 10 10A10.011 10.011 0 0 0 12 2Zm1 14.93A7.014 7.014 0 0 1 5.07 11H7a5 5 0 0 0 6 4.9Zm5.93-5.93A7.014 7.014 0 0 1 13 18.93V17a5 5 0 0 0 4.93-6Z"/>
+          </svg>
+        </div>
+        <h1 class="title">{{ title }}</h1>
       </div>
-    </div>
-  </section>
 
-  <section class="summary" *ngIf="summary()">
-    <h2>Summary</h2>
-    <pre>{{ summary() }}</pre>
-  </section>
+      <div class="actions">
+        <button class="btn ghost" (click)="clear()" title="Clear chat">Clear chat</button>
+      </div>
+    </header>
 
-  <section class="error" *ngIf="error()">
-    <strong>Error:</strong> {{ error() }}
-  </section>
+    <!-- Upload / Dropzone -->
+    <section class="upload card slide-up delay-1">
+      <div class="drop"
+           (drop)="onDrop($event)"
+           (dragover)="onDragOver($event)">
+        <div class="drop-inner">
+          <div class="drop-icon">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 16v-6m0 0l-3 3m3-3l3 3M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+              <path d="M16 13V8a4 4 0 1 0-8 0v5"/>
+            </svg>
+          </div>
+          <p class="drop-text">
+            <strong>Drop PDF / DOCX / TXT here</strong>
+            <span>or</span>
+          </p>
+
+          <label class="btn primary file-btn">
+            Select files
+            <input type="file"
+                   multiple
+                   (change)="onPick($event)"
+                   accept=".pdf,.docx,.txt" />
+          </label>
+
+          <div class="progress" *ngIf="uploading()">Uploading &amp; processing…</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Docs list -->
+    <section class="docs card slide-up delay-2" *ngIf="docs().length">
+      <div class="section-head">
+        <h2>Uploaded Notes</h2>
+      </div>
+
+      <ul class="doc-grid">
+        <li class="doc-item" *ngFor="let d of docs()">
+          <label class="doc-row">
+            <input type="checkbox"
+                   [checked]="selected().has(d.id)"
+                   (change)="toggleDoc(d.id)" />
+            <div class="doc-meta">
+              <div class="doc-name">{{ d.name }}</div>
+              <div class="doc-sub"> {{ d.chunkCount }} chunks </div>
+            </div>
+          </label>
+          <button class="btn soft" (click)="doSummarize(d)">Summarize</button>
+        </li>
+      </ul>
+    </section>
+
+    <!-- Ask -->
+    <section class="ask card slide-up delay-3">
+      <div class="section-head">
+        <h2>Ask your notes</h2>
+        <p class="hint">Tip: select specific docs above to narrow context. K = how many chunks to retrieve.</p>
+      </div>
+
+      <div class="controls">
+        <div class="input-wrap">
+          <input [(ngModel)]="question"
+                 class="input"
+                 placeholder="e.g., What are the 3 key steps of cellular respiration?" />
+        </div>
+
+        <label class="k-wrap" title="Top-K chunks to include in the answer">
+          <span>K</span>
+          <input type="number" [(ngModel)]="k" min="3" max="12" class="input k-input">
+        </label>
+
+        <button class="btn primary lg" (click)="ask()">
+          <span>Ask</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- Chat -->
+    <section class="chat card slide-up delay-4" *ngIf="chat().length">
+      <div class="section-head">
+        <h2>Chat</h2>
+      </div>
+
+      <div class="bubble-wrap">
+        <div class="bubble" *ngFor="let m of chat()"
+             [class.me]="m.role==='user'"
+             [class.ai]="m.role==='assistant'">
+          <div class="bubble-inner">
+            <pre>{{ m.content }}</pre>
+            <div class="cites" *ngIf="m.citations?.length">
+              <span *ngFor="let c of m.citations" class="cite-pill">
+                [{{c.label}} {{c.name}}#{{c.chunkId}}]
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Summary -->
+    <section class="summary card slide-up delay-5" *ngIf="summary()">
+      <div class="section-head">
+        <h2>Summary</h2>
+      </div>
+      <div class="summary-box">
+        <pre>{{ summary() }}</pre>
+      </div>
+    </section>
+
+    <!-- Error -->
+    <section class="toast error slide-up delay-5" *ngIf="error()">
+      <div class="toast-inner">
+        <strong>Error:</strong> {{ error() }}
+      </div>
+    </section>
+
+    <footer class="foot fade-in delay-6">
+      <span>ScholarAI — local demo (text-only store, embeddings on-demand)</span>
+    </footer>
+  </div>
 </div>
