@@ -355,6 +355,42 @@ Cite like [${top.map((_, i) => i + 1).join(', ')}] where relevant. Be concise an
   }
 });
 
+// Summarize a single doc (concise bullets). Stores only text; no embeddings needed.
+app.post('/api/summarize', async (req, res) => {
+  try {
+    const { docId, maxChars = 100_000 } = req.body || {};
+    if (!docId) return res.status(400).json({ error: 'Missing docId' });
+
+    const store = loadStore();
+    const doc = store.docs.find(d => d.id === docId);
+    if (!doc) return res.status(404).json({ error: 'Doc not found' });
+
+    // Build a bounded input to keep memory and tokens in check
+    let text = '';
+    for (const ch of doc.chunks) {
+      if (text.length >= maxChars) break;
+      const remain = maxChars - text.length;
+      text += (text ? '\n\n' : '') + ch.text.slice(0, remain);
+    }
+    if (!text) return res.status(400).json({ error: 'Document is empty' });
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.3,
+      messages: [
+        { role: 'system', content: 'Summarize the content into clear bullet points with short headings where helpful. Include key terms, definitions, formulas, and any dates. Be concise.' },
+        { role: 'user', content: text }
+      ]
+    });
+
+    res.json({ summary: completion.choices[0]?.message?.content || '' });
+  } catch (err) {
+    console.error('summarize route error:', err);
+    res.status(500).json({ error: String(err?.message || err) });
+  }
+});
+
+
 // Global guards
 app.use((err, _req, res, _next) => {
   console.error('global error handler:', err);
